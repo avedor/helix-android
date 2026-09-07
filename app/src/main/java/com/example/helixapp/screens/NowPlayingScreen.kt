@@ -505,9 +505,11 @@ fun NowPlayingScreen() {
         activeDeviceId != myDeviceId &&
         !isPlaying
 
+    val ws = wsClock
+    val rest = restClock
     val serverClock =
-        if (wsClock != null && (restClock == null || wsClock.serverTimeMs >= restClock.serverTimeMs)) wsClock
-        else restClock
+        if (ws != null && (rest == null || ws.serverTimeMs >= rest.serverTimeMs)) ws
+        else rest
 
     LaunchedEffect(controller, now?.queueItemId, metaMediaId, isViewerMode, serverClock) {
         val c = controller ?: return@LaunchedEffect
