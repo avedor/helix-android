@@ -41,6 +41,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -67,7 +68,10 @@ import com.example.helixapp.ui.theme.HelixSurfaceRaised
 import com.example.helixapp.playback.HelixTransport
 import com.example.helixapp.playback.NowPlayingUi
 import com.example.helixapp.playback.PlaybackController
+import com.example.helixapp.playback.PlaybackOwnership
 import com.example.helixapp.playback.PlayerCommandCoordinator
+import com.example.helixapp.playback.PlayerRealtime
+import com.example.helixapp.playback.ServerClockFrame
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -112,6 +116,9 @@ fun NowPlayingScreen() {
     var durationMs by remember { mutableStateOf(0L) }
     var userSeeking by remember { mutableStateOf(false) }
     var seekTargetMs by remember { mutableStateOf(0L) }
+    var restClock by remember { mutableStateOf<ServerClockFrame?>(null) }
+    var remoteActiveDeviceId by remember { mutableStateOf<String?>(null) }
+    var activeDeviceName by remember { mutableStateOf<String?>(null) }
 
     fun fmt(ms: Long): String {
         val totalSec = (ms.coerceAtLeast(0L) / 1000L).toInt()
@@ -152,6 +159,21 @@ fun NowPlayingScreen() {
                     ?.trim()
                     ?.takeIf { it.isNotBlank() }
 
+                remoteActiveDeviceId = root
+                    .optString("active_device_id", "")
+                    .takeIf { it.isNotBlank() }
+
+                val queueItemId = nowUi?.queueItemId
+                if (!queueItemId.isNullOrBlank()) {
+                    restClock = ServerClockFrame(
+                        queueItemId = queueItemId,
+                        positionMs = root.optLong("position_ms", 0L),
+                        positionUpdatedAtMs = root.optLong("position_updated_at_ms", 0L),
+                        serverTimeMs = root.optLong("server_time_ms", 0L),
+                        isPlaying = root.optBoolean("is_playing", false),
+                    )
+                }
+
                 currentYtVideoId = nowUi?.ytVideoId?.takeIf { it.isNotBlank() }
                 currentSubsonicSongId = nowUi?.subsonicSongId?.takeIf { it.isNotBlank() }
 
@@ -171,6 +193,10 @@ fun NowPlayingScreen() {
     }
 
     LaunchedEffect(Unit) { refresh() }
+
+    // Server-authoritative playhead frames stream on the socket while it is open; a
+    // REST playerState() snapshot seeds the clock before the first frame arrives.
+    val wsClock by PlayerRealtime.serverClock.collectAsState()
 
     suspend fun resolveCurrentSubsonicAvailability(): Boolean {
         val current = now ?: return false
@@ -456,30 +482,96 @@ fun NowPlayingScreen() {
         !now?.queueItemId.isNullOrBlank() &&
         metaMediaId == now?.queueItemId
 
-    LaunchedEffect(controller, now?.queueItemId, metaMediaId) {
+    fun effectiveServerPositionMs(frame: ServerClockFrame): Long {
+        val base = frame.positionMs.coerceAtLeast(0L)
+        if (!frame.isPlaying) return base
+        val anchor = frame.positionUpdatedAtMs
+        if (anchor <= 0L) return base
+        // Mirror the web frontend: derive a one-time clock offset and extrapolate
+        // from the anchor instead of trusting device wall clocks directly.
+        val offset = frame.serverTimeMs - System.currentTimeMillis()
+        val nowServer = System.currentTimeMillis() + offset
+        val elapsed = (nowServer - anchor).coerceAtLeast(0L)
+        return base + elapsed
+    }
+
+    val myDeviceId = PlaybackOwnership.ownDeviceId(ctx)
+    val activeDeviceId = (PlaybackOwnership.activeDeviceId()
+        .takeIf { it.isNotBlank() } ?: remoteActiveDeviceId)
+    val isViewerMode =
+        now != null &&
+        activeDeviceId != null &&
+        activeDeviceId.isNotBlank() &&
+        activeDeviceId != myDeviceId &&
+        !isPlaying
+
+    val serverClock =
+        if (wsClock != null && (restClock == null || wsClock.serverTimeMs >= restClock.serverTimeMs)) wsClock
+        else restClock
+
+    LaunchedEffect(controller, now?.queueItemId, metaMediaId, isViewerMode, serverClock) {
         val c = controller ?: return@LaunchedEffect
 
         while (true) {
             if (!userSeeking) {
-                val stillMatchesBackend =
-                    !c.currentMediaItem?.mediaId.isNullOrBlank() &&
-                    !now?.queueItemId.isNullOrBlank() &&
-                    c.currentMediaItem?.mediaId == now?.queueItemId
-
-                if (stillMatchesBackend) {
-                    val d = runCatching { c.duration }.getOrDefault(0L)
-                    val p = runCatching { c.currentPosition }.getOrDefault(0L)
-                    val backendDur = now?.durationMs ?: 0L
-                    durationMs = if (d > 0) d else backendDur
-                    positionMs = if (p > 0) p else 0L
-                } else {
+                if (
+                    isViewerMode &&
+                    serverClock != null &&
+                    serverClock.queueItemId == now?.queueItemId &&
+                    (now?.durationMs ?: 0L) > 0L
+                ) {
+                    // A different device owns the clock and we are not making sound:
+                    // mirror the server playhead instead of our paused Media3 element.
                     durationMs = now?.durationMs ?: 0L
-                    positionMs = 0L
+                    positionMs = effectiveServerPositionMs(serverClock)
+                        .coerceIn(0L, durationMs)
+                } else {
+                    val stillMatchesBackend =
+                        !c.currentMediaItem?.mediaId.isNullOrBlank() &&
+                        !now?.queueItemId.isNullOrBlank() &&
+                        c.currentMediaItem?.mediaId == now?.queueItemId
+
+                    if (stillMatchesBackend) {
+                        val d = runCatching { c.duration }.getOrDefault(0L)
+                        val p = runCatching { c.currentPosition }.getOrDefault(0L)
+                        val backendDur = now?.durationMs ?: 0L
+                        durationMs = if (d > 0) d else backendDur
+                        positionMs = if (p > 0) p else 0L
+                    } else {
+                        durationMs = now?.durationMs ?: 0L
+                        positionMs = 0L
+                    }
                 }
             }
 
             delay(500)
         }
+    }
+
+    LaunchedEffect(activeDeviceId) {
+        if (activeDeviceId.isNullOrBlank() || activeDeviceId == myDeviceId) {
+            activeDeviceName = null
+            return@LaunchedEffect
+        }
+        activeDeviceName = null
+        val api = HelixClient.create(ctx, HelixPrefs.getBaseUrl(ctx))
+        val resp = withContext(Dispatchers.IO) { runCatching { api.playerDevices() }.getOrNull() }
+        val devices = resp
+            ?.takeIf { it.isSuccessful }
+            ?.body()
+            ?.takeIf { it.isNotBlank() }
+            ?.let { runCatching { JSONObject(it).optJSONArray("devices") }.getOrNull() }
+            ?: return@LaunchedEffect
+
+        var name: String? = null
+        for (i in 0 until devices.length()) {
+            val device = devices.optJSONObject(i) ?: continue
+            if (device.optString("id", "") == activeDeviceId) {
+                name = device.optString("name", "").trim().takeIf { it.isNotBlank() }
+                break
+            }
+        }
+        activeDeviceName = name
     }
 
     val baseUrl = HelixPrefs.getBaseUrl(ctx)
@@ -898,7 +990,24 @@ fun NowPlayingScreen() {
                     }
                 }
 
-                Spacer(Modifier.height(6.dp))
+                if (isViewerMode) {
+                    Spacer(Modifier.height(8.dp))
+                    Surface(
+                        color = HelixSurfaceRaised,
+                        shape = RoundedCornerShape(999.dp),
+                        border = BorderStroke(1.dp, HelixBorder),
+                    ) {
+                        Text(
+                            text = "Playing on ${activeDeviceName ?: "another device"}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = HelixMuted,
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+                        )
+                    }
+                    Spacer(Modifier.height(6.dp))
+                } else {
+                    Spacer(Modifier.height(6.dp))
+                }
 
                 Slider(
                     value = if (safeDur > 0) safePos.toFloat() else 0f,
@@ -917,7 +1026,7 @@ fun NowPlayingScreen() {
                         userSeeking = false
                     },
                     valueRange = if (safeDur > 0) 0f..safeDur.toFloat() else 0f..0f,
-                    enabled = safeDur > 0 && mediaMatchesBackend,
+                    enabled = safeDur > 0 && mediaMatchesBackend && !isViewerMode,
                     modifier = Modifier.fillMaxWidth(),
                 )
 

@@ -132,6 +132,9 @@ interface HelixApi {
     @GET("api/playback/state")
     suspend fun playerState(): Response<String>
 
+    @GET("api/player/devices")
+    suspend fun playerDevices(): Response<String>
+
     @POST("api/playback/track")
     suspend fun playTrack(@Body payload: RequestBody): Response<String>
     @POST("api/playback/album")

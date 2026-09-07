@@ -11,6 +11,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
@@ -19,6 +21,21 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+
+/**
+ * A server-authoritative playhead snapshot plus the clock fields needed to
+ * extrapolate it client-side: `position_ms` is anchored at the server's epoch
+ * millisecond `position_updated_at_ms`, and `server_time_ms` is the server's wall
+ * clock at frame build time. Viewers derive a one-time clock offset from the two
+ * times and extrapolate from the anchor, matching the web frontend.
+ */
+data class ServerClockFrame(
+    val queueItemId: String,
+    val positionMs: Long,
+    val positionUpdatedAtMs: Long,
+    val serverTimeMs: Long,
+    val isPlaying: Boolean,
+)
 
 /**
  * Process-wide realtime mirror of the web frontend's usePlayer() websocket behavior.
@@ -35,6 +52,11 @@ object PlayerRealtime {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val syncRequests = Channel<Unit>(Channel.CONFLATED)
     private val client = OkHttpClient.Builder().build()
+
+    /** Latest server playhead frame observed on the socket. Null until a state/progress
+     *  message names a queue item. Now Playing extrapolates this while acting as a viewer. */
+    private val _serverClock = MutableStateFlow<ServerClockFrame?>(null)
+    val serverClock: StateFlow<ServerClockFrame?> = _serverClock
 
     @Volatile private var appContext: Context? = null
     @Volatile private var socket: WebSocket? = null
@@ -88,6 +110,7 @@ object PlayerRealtime {
         lastIsPlaying = null
         lastCurrentWasQueued = null
         lastActiveDeviceId = null
+        _serverClock.value = null
         val old = socket
         socket = null
         old?.close(1000, "Helix connection changed")
@@ -173,6 +196,21 @@ object PlayerRealtime {
 
     private fun handleMessage(text: String) {
         val message = runCatching { JSONObject(text) }.getOrNull() ?: return
+
+        if (message.optString("type") == "player.progress") {
+            val itemId = message.optString("queue_item_id", "").takeIf { it.isNotBlank() } ?: return
+            // Progress frames fire only while the active renderer is advancing, so the
+            // clock is implicitly 'playing'; the next player.state restates a pause.
+            _serverClock.value = ServerClockFrame(
+                queueItemId = itemId,
+                positionMs = message.optLong("position_ms", 0L),
+                positionUpdatedAtMs = message.optLong("position_updated_at_ms", 0L),
+                serverTimeMs = message.optLong("server_time_ms", 0L),
+                isPlaying = true,
+            )
+            return
+        }
+
         if (message.optString("type") != "player.state") return
         val state = message.optJSONObject("state") ?: return
 
@@ -211,6 +249,16 @@ object PlayerRealtime {
             ?.optString("id", now.optString("queue_item_id", ""))
             ?.takeIf { it.isNotBlank() }
         val isPlaying = state.optBoolean("is_playing", false)
+
+        if (queueItemId != null) {
+            _serverClock.value = ServerClockFrame(
+                queueItemId = queueItemId,
+                positionMs = state.optLong("position_ms", 0L),
+                positionUpdatedAtMs = state.optLong("position_updated_at_ms", 0L),
+                serverTimeMs = state.optLong("server_time_ms", 0L),
+                isPlaying = isPlaying,
+            )
+        }
 
         // A queue rebuild can temporarily leave now_playing pointing at an item that has
         // already been removed from the queue. The queue-item ID may therefore remain the

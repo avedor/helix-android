@@ -23,6 +23,9 @@ object PlaybackOwnership {
         this.activeDeviceId = activeDeviceId
     }
 
+    /** The device the server currently lets drive the playback clock (blank if none). */
+    fun activeDeviceId(): String = activeDeviceId
+
     fun isActiveDevice(context: Context): Boolean {
         val active = activeDeviceId
         return active.isNotBlank() && active == ownDeviceId(context)
