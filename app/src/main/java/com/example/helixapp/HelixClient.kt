@@ -18,6 +18,7 @@ object HelixClient {
         }
         return OkHttpClient.Builder()
             .addInterceptor(authCookieInterceptor(context))
+            .addInterceptor(deviceHeaderInterceptor(context))
             .addInterceptor(logging)
             .build()
     }
@@ -32,6 +33,17 @@ object HelixClient {
             } else {
                 chain.request()
             }
+            chain.proceed(req)
+        }
+    }
+
+    private fun deviceHeaderInterceptor(context: Context): Interceptor {
+        return Interceptor { chain ->
+            val req = chain.request().newBuilder()
+                .header("X-Helix-Device-Id", HelixPrefs.getDeviceId(context))
+                .header("X-Helix-Device-Name", HelixPrefs.getDeviceName(context))
+                .header("X-Helix-Device-Kind", HelixPrefs.DEVICE_KIND)
+                .build()
             chain.proceed(req)
         }
     }

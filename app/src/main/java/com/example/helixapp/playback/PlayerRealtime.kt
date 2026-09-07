@@ -1,6 +1,7 @@
 package com.example.helixapp.playback
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
 import com.example.helixapp.HelixPrefs
 import com.example.helixapp.RefreshSignals
@@ -44,6 +45,7 @@ object PlayerRealtime {
     @Volatile private var lastQueueItemId: String? = null
     @Volatile private var lastIsPlaying: Boolean? = null
     @Volatile private var lastCurrentWasQueued: Boolean? = null
+    @Volatile private var lastActiveDeviceId: String? = null
 
     private var reconnectJob: Job? = null
     private var pingJob: Job? = null
@@ -85,6 +87,7 @@ object PlayerRealtime {
         lastQueueItemId = null
         lastIsPlaying = null
         lastCurrentWasQueued = null
+        lastActiveDeviceId = null
         val old = socket
         socket = null
         old?.close(1000, "Helix connection changed")
@@ -108,7 +111,18 @@ object PlayerRealtime {
             baseUrl.startsWith("http://", ignoreCase = true) -> "ws://" + baseUrl.substringAfter("://")
             else -> "ws://$baseUrl"
         }
-        val url = "$socketBase/ws/player"
+
+        // Identify this renderer to /ws/player so the server can broadcast the
+        // active device and hand the clock back and forth between clients.
+        val url = buildString {
+            append(socketBase)
+            append("/ws/player?device_id=")
+            append(Uri.encode(HelixPrefs.getDeviceId(ctx)))
+            append("&device_name=")
+            append(Uri.encode(HelixPrefs.getDeviceName(ctx)))
+            append("&device_kind=")
+            append(Uri.encode(HelixPrefs.DEVICE_KIND))
+        }
         activeConnectionKey = connectionKey(ctx)
 
         val request = Request.Builder()
@@ -170,6 +184,28 @@ object PlayerRealtime {
 
         RefreshSignals.bumpPlayer()
 
+        val activeDeviceId = state.optString("active_device_id", "")
+        PlaybackOwnership.record(activeDeviceId)
+
+        val changedActive = activeDeviceId != lastActiveDeviceId
+        lastActiveDeviceId = activeDeviceId
+
+        // A different renderer owns the clock now. Pause the local player without a
+        // transport POST: a POST (e.g. api.pause()) would claim this device as active
+        // again and defeat the handoff.
+        val ctx = appContext
+        if (ctx != null && activeDeviceId.isNotBlank() && activeDeviceId != PlaybackOwnership.ownDeviceId(ctx)) {
+            scope.launch {
+                runCatching {
+                    val snap = PlaybackController.snapshot(ctx)
+                    if (snap.isPlaying) {
+                        Log.i(TAG, "Device $activeDeviceId took over playback; yielding local renderer")
+                        PlaybackController.pause(ctx)
+                    }
+                }.onFailure { Log.w(TAG, "Failed to yield playback after takeover", it) }
+            }
+        }
+
         val now = state.optJSONObject("now_playing")
         val queueItemId = now
             ?.optString("id", now.optString("queue_item_id", ""))
@@ -198,7 +234,8 @@ object PlayerRealtime {
             queueItemId != lastQueueItemId ||
             isPlaying != lastIsPlaying ||
             currentIsQueued != lastCurrentWasQueued ||
-            (queueItemId != null && !currentIsQueued)
+            (queueItemId != null && !currentIsQueued) ||
+            changedActive
 
         lastQueueItemId = queueItemId
         lastIsPlaying = isPlaying
@@ -259,6 +296,7 @@ object PlayerRealtime {
 
     private fun connectionKey(context: Context): String {
         return HelixPrefs.getBaseUrl(context).trim().trimEnd('/') + "|" +
-            HelixPrefs.getSessionToken(context).orEmpty()
+            HelixPrefs.getSessionToken(context).orEmpty() + "|" +
+            HelixPrefs.getDeviceId(context)
     }
 }

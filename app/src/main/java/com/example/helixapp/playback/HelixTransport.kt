@@ -93,6 +93,13 @@ object HelixTransport {
         }
 
         val isPlaying = state.optBoolean("is_playing", true)
+        val activeDeviceId = state.optString("active_device_id", "")
+        PlaybackOwnership.record(activeDeviceId)
+
+        // When another device is the active renderer this app is a viewer: apply state
+        // to the local Media3 timeline so metadata stays fresh, but never resume local
+        // audio (that would fight the owner and re-claim the clock).
+        val isRenderCandidate = PlaybackOwnership.isRenderCandidate(ctx)
         lastSourceLower = now.optString("source", "").lowercase()
 
         val title = now.optString("title", "")
@@ -121,9 +128,13 @@ object HelixTransport {
 
         if (shouldLoad) {
             Log.d("HELIX_PLAYER", "Applying current-only Media3 item now=$qid")
-            PlaybackController.setCurrentItem(ctx, currentItem, autoplay = isPlaying)
+            PlaybackController.setCurrentItem(ctx, currentItem, autoplay = isPlaying && isRenderCandidate)
         } else {
-            if (isPlaying) PlaybackController.resume(ctx) else PlaybackController.pause(ctx)
+            if (isPlaying && isRenderCandidate) {
+                PlaybackController.resume(ctx)
+            } else {
+                PlaybackController.pause(ctx)
+            }
         }
 
         if (forceRestart) Log.d("HELIX_PLAYER", "forceRestart=true")

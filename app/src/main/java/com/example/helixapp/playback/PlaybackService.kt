@@ -25,13 +25,18 @@ import com.example.helixapp.HelixPrefs
 import com.example.helixapp.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 
 class PlaybackService : MediaSessionService() {
 
@@ -48,6 +53,9 @@ class PlaybackService : MediaSessionService() {
 
     @Volatile private var lastStreamErrorUri: String? = null
     @Volatile private var streamErrorRetryCount: Int = 0
+
+    @Volatile private var lastPositionReportAtMs: Long = 0L
+    private var positionReportJob: Job? = null
 
     private val noisyAudioReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -99,6 +107,13 @@ class PlaybackService : MediaSessionService() {
             .build()
 
         player.addListener(object : Player.Listener {
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (!isPlaying) {
+                    // Freeze the server-authoritative clock on pause.
+                    reportPosition(force = true)
+                }
+            }
+
             override fun onPlaybackStateChanged(state: Int) {
                 Log.d(
                     "HELIX_PLAYER",
@@ -193,6 +208,7 @@ class PlaybackService : MediaSessionService() {
 
         registerNoisyAudioReceiver()
         refreshAuthHeaders()
+        startPositionReporter()
 
         // A cold service start must begin paused, but the pause handshake must finish
         // before the MediaSession starts accepting intentional Play commands.
@@ -209,10 +225,29 @@ class PlaybackService : MediaSessionService() {
                         HelixPrefs.getBaseUrl(this@PlaybackService),
                         startRealtime = false,
                     )
-                    withContext(Dispatchers.IO) { api.pause() }
+
+                    // Do not claim the clock with a pause when another device is already
+                    // rendering: opening the app must not steal playback from the web.
+                    val activeDeviceId = withContext(Dispatchers.IO) {
+                        runCatching {
+                            val resp = api.playerState()
+                            if (!resp.isSuccessful) return@runCatching ""
+                            resp.body()?.let { JSONObject(it).optString("active_device_id", "") } ?: ""
+                        }.getOrDefault("")
+                    }
+                    PlaybackOwnership.record(activeDeviceId)
+
+                    if (activeDeviceId.isBlank() || activeDeviceId == PlaybackOwnership.ownDeviceId(this@PlaybackService)) {
+                        withContext(Dispatchers.IO) { api.pause() }
+                    } else {
+                        Log.i(
+                            "HELIX_PLAYER",
+                            "Another device ($activeDeviceId) is active; skipping startup pause claim",
+                        )
+                    }
                 }
             } catch (e: Exception) {
-                Log.w("HELIX_PLAYER", "Initial backend pause failed", e)
+                Log.w("HELIX_PLAYER", "Initial backend sync failed", e)
             }
         }
     }
@@ -247,12 +282,19 @@ class PlaybackService : MediaSessionService() {
         scope.launch {
             try {
                 withTimeoutOrNull(TASK_REMOVAL_PAUSE_TIMEOUT_MS) {
-                    val api = HelixClient.create(
-                        this@PlaybackService,
-                        HelixPrefs.getBaseUrl(this@PlaybackService),
-                        startRealtime = false,
-                    )
-                    withContext(Dispatchers.IO) { api.pause() }
+                    if (PlaybackOwnership.isRenderCandidate(this@PlaybackService)) {
+                        val api = HelixClient.create(
+                            this@PlaybackService,
+                            HelixPrefs.getBaseUrl(this@PlaybackService),
+                            startRealtime = false,
+                        )
+                        withContext(Dispatchers.IO) { api.pause() }
+                    } else {
+                        Log.i(
+                            "HELIX_PLAYER",
+                            "Not the active renderer; skipping pause on task removal",
+                        )
+                    }
                 }
             } catch (e: Exception) {
                 Log.w("HELIX_PLAYER", "Backend pause during task removal failed", e)
@@ -270,6 +312,9 @@ class PlaybackService : MediaSessionService() {
 
     override fun onDestroy() {
         unregisterNoisyAudioReceiver()
+
+        positionReportJob?.cancel()
+        positionReportJob = null
 
         if (::player.isInitialized) {
             player.pause()
@@ -319,8 +364,54 @@ class PlaybackService : MediaSessionService() {
         httpFactory.setDefaultRequestProperties(
             mapOf(
                 "Cookie" to "mr_session=$token",
+                "X-Helix-Device-Id" to HelixPrefs.getDeviceId(this),
+                "X-Helix-Device-Name" to HelixPrefs.getDeviceName(this),
+                "X-Helix-Device-Kind" to HelixPrefs.DEVICE_KIND,
             )
         )
+    }
+
+    private fun startPositionReporter() {
+        positionReportJob?.cancel()
+        positionReportJob = scope.launch {
+            while (isActive) {
+                delay(POSITION_REPORT_INTERVAL_MS)
+                reportPosition(force = false)
+            }
+        }
+    }
+
+    private fun reportPosition(force: Boolean = false) {
+        if (!PlaybackOwnership.isRenderCandidate(this)) return
+        val itemId = player.currentMediaItem?.mediaId
+        if (itemId.isNullOrBlank()) return
+        if (!force && !player.isPlaying) return
+
+        val elapsed = SystemClock.elapsedRealtime()
+        if (!force && elapsed - lastPositionReportAtMs < POSITION_REPORT_MIN_INTERVAL_MS) return
+        lastPositionReportAtMs = elapsed
+
+        val queueItemId = itemId
+        val positionMs = player.currentPosition.coerceAtLeast(0L)
+        scope.launch {
+            runCatching {
+                val api = HelixClient.create(
+                    this@PlaybackService,
+                    HelixPrefs.getBaseUrl(this@PlaybackService),
+                    startRealtime = false,
+                )
+                withContext(Dispatchers.IO) {
+                    val payload = JSONObject()
+                        .put("queue_item_id", queueItemId)
+                        .put("position_ms", positionMs)
+                    api.reportPosition(
+                        payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+                    )
+                }
+            }.onFailure {
+                Log.w("HELIX_PLAYER", "Position report failed", it)
+            }
+        }
     }
 
     private fun shouldRetryTemporaryStreamError(
@@ -436,5 +527,8 @@ class PlaybackService : MediaSessionService() {
 
         private const val STARTUP_PAUSE_TIMEOUT_MS = 2_000L
         private const val TASK_REMOVAL_PAUSE_TIMEOUT_MS = 2_000L
+
+        private const val POSITION_REPORT_INTERVAL_MS = 4_000L
+        private const val POSITION_REPORT_MIN_INTERVAL_MS = 3_500L
     }
 }

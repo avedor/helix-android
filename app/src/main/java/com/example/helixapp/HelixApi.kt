@@ -168,6 +168,9 @@ interface HelixApi {
     @POST("api/playback/ended")
     suspend fun ended(): Response<String>
 
+    @POST("api/playback/position")
+    suspend fun reportPosition(@Body payload: RequestBody): Response<String>
+
 
     // Subsonic availability (batch resolver)
     @POST("api/subsonic/resolve")

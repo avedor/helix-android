@@ -1,6 +1,8 @@
 package com.example.helixapp
 
 import android.content.Context
+import android.os.Build
+import java.util.UUID
 
 object HelixPrefs {
     private const val PREFS = "helix_prefs"
@@ -8,6 +10,29 @@ object HelixPrefs {
     private const val KEY_SESSION_TOKEN = "mr_session"
     private const val KEY_USERNAME = "username"
     private const val KEY_LAST_STATION_NAME = "last_station_name"
+    private const val KEY_DEVICE_ID = "device_id"
+
+    /** Stable renderer identity reported to Helix via X-Helix-Device-* headers. */
+    const val DEVICE_KIND = "android"
+
+    fun getDeviceId(context: Context): String {
+        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        p.getString(KEY_DEVICE_ID, null)?.let { if (it.isNotBlank()) return it }
+        val generated = UUID.randomUUID().toString()
+        p.edit().putString(KEY_DEVICE_ID, generated).apply()
+        return generated
+    }
+
+    fun getDeviceName(context: Context): String {
+        val manufacturer = Build.MANUFACTURER.trim()
+        val model = Build.MODEL.trim()
+        val name = buildString {
+            if (manufacturer.isNotBlank()) append(manufacturer)
+            if (manufacturer.isNotBlank() && model.isNotBlank()) append(' ')
+            if (model.isNotBlank()) append(model)
+        }.trim()
+        return name.ifBlank { "Helix Android" }
+    }
 
     fun getBaseUrl(context: Context, defaultValue: String = "http://192.168.0.96:10011"): String {
         val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
