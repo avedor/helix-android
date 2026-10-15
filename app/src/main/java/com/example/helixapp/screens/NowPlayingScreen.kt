@@ -31,6 +31,8 @@ import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -102,6 +104,9 @@ fun NowPlayingScreen() {
 
     var isPlaying by remember { mutableStateOf(false) }
     var playPauseInFlight by remember { mutableStateOf(false) }
+    var devicesMenuOpen by remember { mutableStateOf(false) }
+    var deviceTargets by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
+    var transferInFlight by remember { mutableStateOf(false) }
 
     var isLiked by remember { mutableStateOf(false) }
     var isDisliked by remember { mutableStateOf(false) }
@@ -576,6 +581,49 @@ fun NowPlayingScreen() {
         activeDeviceName = name
     }
 
+    fun loadDeviceTargets() {
+        scope.launch {
+            val api = HelixClient.create(ctx, HelixPrefs.getBaseUrl(ctx))
+            val resp = withContext(Dispatchers.IO) { runCatching { api.playerDevices() }.getOrNull() }
+            val arr = resp
+                ?.takeIf { it.isSuccessful }
+                ?.body()
+                ?.let { runCatching { JSONObject(it).optJSONArray("devices") }.getOrNull() }
+            val targets = ArrayList<Pair<String, String>>()
+            if (arr != null) {
+                val own = PlaybackOwnership.ownDeviceId(ctx)
+                for (i in 0 until arr.length()) {
+                    val device = arr.optJSONObject(i) ?: continue
+                    val id = device.optString("id", "")
+                    if (id.isBlank() || id == own) continue
+                    val name = device.optString("name", "").ifBlank { device.optString("kind", "Device") }
+                    targets.add(id to name)
+                }
+            }
+            deviceTargets = targets
+        }
+    }
+
+    fun movePlaybackTo(targetId: String) {
+        if (transferInFlight) return
+        transferInFlight = true
+        scope.launch {
+            try {
+                val api = HelixClient.create(ctx, HelixPrefs.getBaseUrl(ctx))
+                val mt = "application/json; charset=utf-8".toMediaType()
+                val payload = JSONObject().put("device_id", targetId).toString().toRequestBody(mt)
+                withContext(Dispatchers.IO) { api.transferPlayback(payload) }
+                // The realtime socket will report the new owner; re-sync so the local
+                // renderer yields immediately and the Media3 metadata stays correct.
+                PlayerCommandCoordinator.syncFromBackend(ctx)
+            } catch (_: Exception) {
+                // Non-fatal: the picker simply stays put on failure.
+            } finally {
+                transferInFlight = false
+            }
+        }
+    }
+
     val baseUrl = HelixPrefs.getBaseUrl(ctx)
     val art = when {
         mediaMatchesBackend && !metaArtUri.isNullOrBlank() -> metaArtUri.orEmpty()
@@ -1010,6 +1058,46 @@ fun NowPlayingScreen() {
                 } else {
                     Spacer(Modifier.height(6.dp))
                 }
+
+                Box {
+                    OutlinedButton(
+                        enabled = now != null && !transferInFlight,
+                        shape = RoundedCornerShape(999.dp),
+                        onClick = {
+                            devicesMenuOpen = true
+                            loadDeviceTargets()
+                        },
+                    ) {
+                        Text(
+                            text = "Play on another device…",
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = devicesMenuOpen,
+                        onDismissRequest = { devicesMenuOpen = false },
+                    ) {
+                        if (deviceTargets.isEmpty()) {
+                            DropdownMenuItem(
+                                text = { Text("No other devices online") },
+                                enabled = false,
+                                onClick = {},
+                            )
+                        } else {
+                            deviceTargets.forEach { (id, name) ->
+                                DropdownMenuItem(
+                                    text = { Text(name) },
+                                    onClick = {
+                                        devicesMenuOpen = false
+                                        movePlaybackTo(id)
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(6.dp))
 
                 Slider(
                     value = if (safeDur > 0) safePos.toFloat() else 0f,

@@ -176,12 +176,14 @@ object PlaybackController {
         ctx: Context,
         current: QueueMediaItem,
         autoplay: Boolean,
+        startPositionMs: Long = 0L,
     ) {
         get(ctx) { c ->
             val mediaItem = current.toMediaItem()
             val existingId = c.currentMediaItem?.mediaId
             val existingUri = c.currentMediaItem?.localConfiguration?.uri
             val desiredUri = mediaItem.localConfiguration?.uri
+            val startMs = startPositionMs.coerceAtLeast(0L)
 
             if (
                 c.mediaItemCount != 1 ||
@@ -190,10 +192,14 @@ object PlaybackController {
             ) {
                 Log.d(
                     "HELIX_PLAYER",
-                    "setCurrentItem(): replacing Media3 timeline with current=${current.queueItemId} autoplay=$autoplay",
+                    "setCurrentItem(): replacing Media3 timeline with current=${current.queueItemId} autoplay=$autoplay startMs=$startMs",
                 )
-                c.setMediaItem(mediaItem, true)
+                // Seed the playhead with the server position so adopting playback
+                // after a handoff does not restart from zero.
+                c.setMediaItem(mediaItem, startMs)
                 c.prepare()
+            } else if (startMs > 0L) {
+                c.seekTo(startMs)
             }
 
             if (autoplay) c.play() else c.pause()
@@ -244,6 +250,18 @@ object PlaybackController {
 
     fun resume(ctx: Context) {
         get(ctx) { it.play() }
+    }
+
+    /**
+     * Adopt playback at a server-authoritative position. Used when another device
+     * hands us the clock so we continue from the shared playhead instead of a
+     * stale local position.
+     */
+    fun resumeFrom(ctx: Context, positionMs: Long) {
+        get(ctx) {
+            it.seekTo(positionMs.coerceAtLeast(0L))
+            it.play()
+        }
     }
 }
 

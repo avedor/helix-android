@@ -27,6 +27,21 @@ object PlayerCommandCoordinator {
         }
     }
 
+    /**
+     * Adopt playback after another device handed us the clock. Unlike a plain
+     * sync, this starts from the server-authoritative [startPositionMs] so the
+     * local renderer continues the shared playhead rather than a stale one.
+     */
+    suspend fun adoptPlayback(context: Context, startPositionMs: Long) {
+        mutex.withLock {
+            HelixTransport.refreshAndSync(
+                context,
+                forceLoadStream = true,
+                startPositionMs = startPositionMs,
+            )
+        }
+    }
+
     suspend fun next(context: Context) {
         mutex.withLock {
             val api = HelixClient.create(context, HelixPrefs.getBaseUrl(context))

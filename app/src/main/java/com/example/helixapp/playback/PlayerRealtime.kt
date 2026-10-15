@@ -50,9 +50,16 @@ object PlayerRealtime {
     private const val FALLBACK_REFRESH_MS = 15_000L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val syncRequests = Channel<Unit>(Channel.CONFLATED)
-    private val client = OkHttpClient.Builder().build()
 
+    /**
+     * A backend sync request. [adoptServerPositionMs] is non-null when another device just
+     * handed this one the clock, in which case the local renderer must jump to the shared
+     * server position instead of resuming from its stale playhead.
+     */
+    private data class SyncRequest(val adoptServerPositionMs: Long?)
+
+    private val syncRequests = Channel<SyncRequest>(Channel.CONFLATED)
+    private val client = OkHttpClient.Builder().build()
     /** Latest server playhead frame observed on the socket. Null until a state/progress
      *  message names a queue item. Now Playing extrapolates this while acting as a viewer. */
     private val _serverClock = MutableStateFlow<ServerClockFrame?>(null)
@@ -81,11 +88,17 @@ object PlayerRealtime {
         if (!started) {
             started = true
             scope.launch {
-                for (ignored in syncRequests) {
+                for (request in syncRequests) {
                     val ctx = appContext ?: continue
                     if (HelixPrefs.getSessionToken(ctx).isNullOrBlank()) continue
-                    runCatching { PlayerCommandCoordinator.syncFromBackend(ctx) }
-                        .onFailure { Log.w(TAG, "Realtime player sync failed", it) }
+                    runCatching {
+                        val adoptMs = request.adoptServerPositionMs
+                        if (adoptMs != null) {
+                            PlayerCommandCoordinator.adoptPlayback(ctx, adoptMs)
+                        } else {
+                            PlayerCommandCoordinator.syncFromBackend(ctx)
+                        }
+                    }.onFailure { Log.w(TAG, "Realtime player sync failed", it) }
                 }
             }
             startFallbackLoop()
@@ -225,6 +238,7 @@ object PlayerRealtime {
         val activeDeviceId = state.optString("active_device_id", "")
         PlaybackOwnership.record(activeDeviceId)
 
+        val previousActive = lastActiveDeviceId
         val changedActive = activeDeviceId != lastActiveDeviceId
         lastActiveDeviceId = activeDeviceId
 
@@ -243,6 +257,16 @@ object PlayerRealtime {
                 }.onFailure { Log.w(TAG, "Failed to yield playback after takeover", it) }
             }
         }
+
+        // Another device handed the clock to us (or we are observing a live transition):
+        // adopt the shared playhead rather than resuming from a stale local position. The
+        // previous-owner check skips the first snapshot after a cold start.
+        val becameActive =
+            previousActive != null &&
+            changedActive &&
+            ctx != null &&
+            activeDeviceId.isNotBlank() &&
+            activeDeviceId == PlaybackOwnership.ownDeviceId(ctx)
 
         val now = state.optJSONObject("now_playing")
         val queueItemId = now
@@ -293,7 +317,21 @@ object PlayerRealtime {
             if (queueItemId != null && !currentIsQueued) {
                 Log.w(TAG, "Realtime state has orphan now_playing=$queueItemId; forcing transport sync")
             }
-            syncRequests.trySend(Unit)
+            // On a handoff, compute the live server position (anchor + server-side elapsed)
+            // so the local renderer continues the shared playhead.
+            val adoptMs =
+                if (becameActive && isPlaying && queueItemId != null && currentIsQueued) {
+                    val elapsed =
+                        state.optLong("server_time_ms", 0L) -
+                            state.optLong("position_updated_at_ms", 0L)
+                    state.optLong("position_ms", 0L) + elapsed.coerceAtLeast(0L)
+                } else {
+                    null
+                }
+            if (adoptMs != null) {
+                Log.i(TAG, "Adopting playback handed off at ${adoptMs}ms")
+            }
+            syncRequests.trySend(SyncRequest(adoptMs))
         }
     }
 
@@ -326,7 +364,7 @@ object PlayerRealtime {
                 delay(FALLBACK_REFRESH_MS)
                 if (!socketOpen) {
                     RefreshSignals.bumpPlayer()
-                    syncRequests.trySend(Unit)
+                    syncRequests.trySend(SyncRequest(null))
                 }
             }
         }

@@ -40,7 +40,12 @@ object HelixTransport {
         return baseUrl.trimEnd('/') + "/api/stream/" + queueItemId
     }
 
-    suspend fun refreshAndSync(ctx: Context, forceLoadStream: Boolean = false, forceRestart: Boolean = false) {
+    suspend fun refreshAndSync(
+        ctx: Context,
+        forceLoadStream: Boolean = false,
+        forceRestart: Boolean = false,
+        startPositionMs: Long? = null,
+    ) {
         val baseUrl = HelixPrefs.getBaseUrl(ctx)
         val api = HelixClient.create(ctx, baseUrl)
 
@@ -126,12 +131,30 @@ object HelixTransport {
         val shouldLoad = forceLoadStream || forceRestart || (lastNowId != qid)
         lastNowId = qid
 
+        // When another device hands us the clock, continue from the shared server
+        // position instead of a stale local playhead.
+        val adoptPositionMs =
+            if (startPositionMs != null && isPlaying && isRenderCandidate) {
+                startPositionMs.coerceAtLeast(0L)
+            } else {
+                null
+            }
+
         if (shouldLoad) {
             Log.d("HELIX_PLAYER", "Applying current-only Media3 item now=$qid")
-            PlaybackController.setCurrentItem(ctx, currentItem, autoplay = isPlaying && isRenderCandidate)
+            PlaybackController.setCurrentItem(
+                ctx,
+                currentItem,
+                autoplay = isPlaying && isRenderCandidate,
+                startPositionMs = adoptPositionMs ?: 0L,
+            )
         } else {
             if (isPlaying && isRenderCandidate) {
-                PlaybackController.resume(ctx)
+                if (adoptPositionMs != null) {
+                    PlaybackController.resumeFrom(ctx, adoptPositionMs)
+                } else {
+                    PlaybackController.resume(ctx)
+                }
             } else {
                 PlaybackController.pause(ctx)
             }
